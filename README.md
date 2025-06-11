@@ -15,7 +15,7 @@ OpenGate is an Android application that automatically calls your gate when you a
 
 ## Screenshot
 
-![OpenGate App Screenshot](app/src/res/screenshot.png)
+<img src="app/src/res/screenshot.png" width="250" alt="OpenGate App Screenshot">
 
 ## Requirements
 
