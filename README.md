@@ -13,6 +13,10 @@ OpenGate is an Android application that automatically calls your gate when you a
 - **Battery Efficient**: Uses FusedLocationProviderClient for optimized location updates
 - **Modern UI**: Built with Material 3 design principles and Jetpack Compose
 
+## Screenshot
+
+![OpenGate App Screenshot](app/src/main/res/screenshot.png)
+
 ## Requirements
 
 - Android 10.0 (API level 29) or higher
