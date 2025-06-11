@@ -7,6 +7,7 @@ import android.location.Location
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,9 +15,11 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Phone
@@ -27,33 +30,65 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.delay
+import android.os.Looper
+import android.widget.Toast
+import androidx.core.app.ActivityCompat
+import kotlin.math.roundToInt
+import android.os.Build
 
 class MainActivity : ComponentActivity() {
     private lateinit var gateSettings: GateSettings
     private lateinit var locationUpdates: LocationUpdates
     private var locationCallback: LocationCallback? = null
-    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private val fusedLocationClient: FusedLocationProviderClient by lazy {
+        LocationServices.getFusedLocationProviderClient(this)
+    }
+
+    // State to track permission
+    private var _hasLocationPermission = mutableStateOf(false)
+    val hasLocationPermission: State<Boolean> = _hasLocationPermission
 
     private val requiredPermissions = arrayOf(
         Manifest.permission.ACCESS_FINE_LOCATION,
-        Manifest.permission.ACCESS_COARSE_LOCATION,
         Manifest.permission.CALL_PHONE,
         Manifest.permission.READ_PHONE_STATE
     )
+
+    private val backgroundLocationPermission = Manifest.permission.ACCESS_BACKGROUND_LOCATION
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (permissions.all { it.value }) {
+            // If we have all basic permissions, request background location
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                requestBackgroundLocation()
+            } else {
+                startLocationUpdates()
+                startGateService()
+            }
+        } else {
+            showPermissionRationale()
+        }
+    }
+
+    private val backgroundLocationLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
             startLocationUpdates()
             startGateService()
         } else {
@@ -61,97 +96,102 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var showBackgroundLocationDialog by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         gateSettings = GateSettings(this)
         locationUpdates = LocationUpdates(this)
 
-        setContent {
-            val snackbarHostState = remember { SnackbarHostState() }
-            val scope = rememberCoroutineScope()
-            var showSettingsSnackbar by remember { mutableStateOf(false) }
+        // Check if we need to request permissions
+        if (!hasAllPermissions()) {
+            // Request permissions first
+            requestPermissions()
+        } else {
+            // We already have all permissions, set the state and show UI
+            _hasLocationPermission.value = true
+            showMainUI()
+        }
+    }
 
+    private fun hasAllPermissions(): Boolean {
+        return requiredPermissions.all { permission ->
+            ContextCompat.checkSelfPermission(
+                this,
+                permission
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun requestPermissions() {
+        ActivityCompat.requestPermissions(
+            this,
+            requiredPermissions,
+            PERMISSIONS_REQUEST_CODE
+        )
+    }
+
+    private fun showMainUI() {
+        setContent {
             MaterialTheme {
-                Scaffold(
-                    snackbarHost = { SnackbarHost(snackbarHostState) }
-                ) { innerPadding ->
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(innerPadding),
-                        color = MaterialTheme.colorScheme.background
-                    ) {
-                        MainScreen(
-                            onSetGateNumber = { number -> 
-                                lifecycleScope.launch {
-                                    gateSettings.setGateNumber(number)
-                                    scope.launch {
-                                        snackbarHostState.showSnackbar("Gate number saved")
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    if (showBackgroundLocationDialog) {
+                        AlertDialog(
+                            onDismissRequest = { showBackgroundLocationDialog = false },
+                            title = { Text("Background Location Required") },
+                            text = { Text("This app needs background location access to automatically call the gate when you approach it, even when the app is closed or the phone is locked.") },
+                            confirmButton = {
+                                TextButton(
+                                    onClick = {
+                                        showBackgroundLocationDialog = false
+                                        backgroundLocationLauncher.launch(backgroundLocationPermission)
                                     }
-                                }
-                            },
-                            onSetHomeLocation = { 
-                                if (ContextCompat.checkSelfPermission(
-                                        this,
-                                        Manifest.permission.ACCESS_FINE_LOCATION
-                                    ) == PackageManager.PERMISSION_GRANTED
                                 ) {
-                                    lifecycleScope.launch {
-                                        try {
-                                            val location = fusedLocationClient.lastLocation.await()
-                                            if (location != null) {
-                                                gateSettings.setHomeLocation(location)
-                                                scope.launch {
-                                                    snackbarHostState.showSnackbar("Home location set successfully")
-                                                }
-                                            } else {
-                                                scope.launch {
-                                                    snackbarHostState.showSnackbar("Could not get current location")
-                                                }
-                                            }
-                                        } catch (e: Exception) {
-                                            scope.launch {
-                                                snackbarHostState.showSnackbar("Error getting location: ${e.message}")
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    showSettingsSnackbar = true
+                                    Text("Grant Permission")
                                 }
                             },
-                            onSetRadius = { radius -> 
-                                lifecycleScope.launch {
-                                    gateSettings.setRadius(radius)
-                                    scope.launch {
-                                        snackbarHostState.showSnackbar("Radius set to ${radius.toInt()} meters")
-                                    }
+                            dismissButton = {
+                                TextButton(
+                                    onClick = { showBackgroundLocationDialog = false }
+                                ) {
+                                    Text("Not Now")
                                 }
                             }
                         )
-
-                        if (showSettingsSnackbar) {
-                            LaunchedEffect(Unit) {
-                                val result = snackbarHostState.showSnackbar(
-                                    message = "Location permission required",
-                                    actionLabel = "Settings",
-                                    duration = SnackbarDuration.Indefinite
-                                )
-                                if (result == SnackbarResult.ActionPerformed) {
-                                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                                        data = Uri.fromParts("package", packageName, null)
-                                    })
+                    }
+                    MainScreen(
+                        hasLocationPermission = hasLocationPermission,
+                        onSetGateNumber = { number ->
+                            lifecycleScope.launch {
+                                gateSettings.setGateNumber(number)
+                                Toast.makeText(this@MainActivity, "Gate number saved", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        onSetHomeLocation = {
+                            if (checkLocationPermission()) {
+                                getCurrentLocation { location ->
+                                    lifecycleScope.launch {
+                                        gateSettings.setHomeLocation(location)
+                                        Toast.makeText(this@MainActivity, "Gate location set", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
-                                showSettingsSnackbar = false
+                            } else {
+                                requestPermissions()
+                            }
+                        },
+                        onSetRadius = { radius ->
+                            lifecycleScope.launch {
+                                gateSettings.setRadius(radius)
                             }
                         }
-                    }
+                    )
                 }
             }
         }
-
-        checkPermissions()
     }
 
     private fun checkPermissions() {
@@ -197,6 +237,52 @@ class MainActivity : ComponentActivity() {
         // This is now handled in the Compose UI
     }
 
+    private fun checkLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun getCurrentLocation(callback: (Location) -> Unit) {
+        if (checkLocationPermission()) {
+            try {
+                fusedLocationClient.lastLocation
+                    .addOnSuccessListener { location ->
+                        if (location != null) {
+                            callback(location)
+                        }
+                    }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error getting location", e)
+            }
+        }
+    }
+
+    private fun requestBackgroundLocation() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            when {
+                ContextCompat.checkSelfPermission(
+                    this,
+                    backgroundLocationPermission
+                ) == PackageManager.PERMISSION_GRANTED -> {
+                    startLocationUpdates()
+                    startGateService()
+                }
+                shouldShowRequestPermissionRationale(backgroundLocationPermission) -> {
+                    showBackgroundLocationRationale()
+                }
+                else -> {
+                    backgroundLocationLauncher.launch(backgroundLocationPermission)
+                }
+            }
+        }
+    }
+
+    private fun showBackgroundLocationRationale() {
+        showBackgroundLocationDialog = true
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         locationCallback?.let { callback ->
@@ -205,34 +291,126 @@ class MainActivity : ComponentActivity() {
         // Stop the gate service when the activity is destroyed
         stopService(Intent(this, GateService::class.java))
     }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERMISSIONS_REQUEST_CODE) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                // All permissions were granted, update state and show UI
+                _hasLocationPermission.value = true
+                showMainUI()
+            } else {
+                // Some permissions were denied, show UI with permission required message
+                _hasLocationPermission.value = false
+                showMainUI()
+            }
+        }
+    }
+
+    companion object {
+        private const val PERMISSIONS_REQUEST_CODE = 1001
+    }
 }
 
 @Composable
 fun MainScreen(
+    hasLocationPermission: State<Boolean>,
     onSetGateNumber: (String) -> Unit,
     onSetHomeLocation: () -> Unit,
     onSetRadius: (Float) -> Unit
 ) {
-    var gateNumber by remember { mutableStateOf("") }
-    var radius by remember { mutableStateOf(100f) }
     val context = LocalContext.current
     val gateSettings = remember { GateSettings(context) }
-    
-    // Collect current settings
-    val currentGateNumber by gateSettings.gateNumber.collectAsState(initial = "")
-    val currentHomeLocation by gateSettings.homeLocation.collectAsState(initial = null)
-    val currentRadius by gateSettings.radius.collectAsState(initial = 100f)
-
+    var gateNumber by remember { mutableStateOf("") }
+    var currentRadius by remember { mutableStateOf(5f) }
+    var currentLocation by remember { mutableStateOf<Location?>(null) }
+    var distanceToGate by remember { mutableStateOf<Float?>(null) }
+    var isEditing by remember { mutableStateOf(false) }
+    var showClearConfirmation by remember { mutableStateOf(false) }
+    var savedGateNumber by remember { mutableStateOf("") }
+    var gateLocation by remember { mutableStateOf<Location?>(null) }
+    var wasInRadius by remember { mutableStateOf(false) }
     val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
+
+    // Function to check if we should call the gate
+    fun checkAndCallGate(distance: Float) {
+        // Only proceed if we have a gate location set
+        if (gateLocation == null) return
+
+        val isInRadius = distance <= currentRadius
+        if (isInRadius && !wasInRadius) {
+            // We just entered the radius, call the gate
+            scope.launch {
+                val number = gateSettings.getGateNumber()
+                if (number.isNotEmpty()) {
+                    val gateCaller = GateCaller(context, gateSettings)
+                    gateCaller.callGate()
+                }
+            }
+        }
+        wasInRadius = isInRadius
+    }
+
+    // Load initial values and start location updates
+    LaunchedEffect(hasLocationPermission.value) {
+        savedGateNumber = gateSettings.getGateNumber()
+        currentRadius = gateSettings.getRadius()
+        gateLocation = gateSettings.getHomeLocation()
+        
+        if (hasLocationPermission.value) {
+            try {
+                val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+                // Get last known location immediately
+                fusedLocationClient.lastLocation.addOnSuccessListener { location ->
+                    if (location != null) {
+                        currentLocation = location
+                        if (gateLocation != null) {
+                            val distance = location.distanceTo(gateLocation!!)
+                            distanceToGate = distance
+                            // Don't check for gate call on initial location load
+                            wasInRadius = distance <= currentRadius
+                        }
+                    }
+                }
+                
+                // Then start continuous updates
+                fusedLocationClient.requestLocationUpdates(
+                    LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000)
+                        .setWaitForAccurateLocation(false)
+                        .setMinUpdateIntervalMillis(2000)
+                        .setMaxUpdateDelayMillis(5000)
+                        .build(),
+                    object : LocationCallback() {
+                        override fun onLocationResult(locationResult: LocationResult) {
+                            locationResult.lastLocation?.let { location ->
+                                currentLocation = location
+                                if (gateLocation != null) {
+                                    val distance = location.distanceTo(gateLocation!!)
+                                    distanceToGate = distance
+                                    checkAndCallGate(distance)
+                                }
+                            }
+                        }
+                    },
+                    Looper.getMainLooper()
+                )
+            } catch (e: Exception) {
+                Log.e("MainScreen", "Error starting location updates", e)
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .verticalScroll(scrollState)
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(24.dp)
+            .padding(16.dp)
+            .verticalScroll(scrollState),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // Header
         Text(
@@ -243,217 +421,280 @@ fun MainScreen(
 
         // Current Settings Card
         ElevatedCard(
-            modifier = Modifier
-                .fillMaxWidth()
-                .animateContentSize()
+            modifier = Modifier.fillMaxWidth()
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                    .padding(16.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Current Settings",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Icon(
-                        imageVector = Icons.Default.Settings,
-                        contentDescription = "Settings",
-                        tint = MaterialTheme.colorScheme.primary
+                Text(
+                    text = "Current Settings",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Current Location
+                SettingItem(
+                    icon = Icons.Default.LocationOn,
+                    label = "Current Location",
+                    value = currentLocation?.let {
+                        "Lat: ${it.latitude}, Lon: ${it.longitude}"
+                    } ?: if (hasLocationPermission.value) {
+                        "Waiting for location..."
+                    } else {
+                        "Location permission required"
+                    }
+                )
+
+                // Distance to Gate
+                if (hasLocationPermission.value && currentLocation != null && gateSettings.getHomeLocation() != null) {
+                    Divider(modifier = Modifier.padding(vertical = 8.dp))
+                    SettingItem(
+                        icon = Icons.Default.LocationOn,
+                        label = "Distance to Gate",
+                        value = distanceToGate?.let {
+                            "${it.toInt()}m"
+                        } ?: "Calculating..."
                     )
                 }
+            }
+        }
 
-                Divider()
-
-                // Gate Number
+        // Current Settings Card
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+            ) {
+                Text(
+                    text = "Current Settings",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(8.dp))
                 SettingItem(
                     icon = Icons.Default.Phone,
                     label = "Gate Number",
-                    value = currentGateNumber.ifEmpty { "Not set" }
-                )
+                    value = savedGateNumber.ifEmpty { "Not set" }
+                ) {
+                    if (isEditing) {
+                        OutlinedTextField(
+                            value = gateNumber,
+                            onValueChange = { gateNumber = it },
+                            label = { Text("Enter gate number") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End
+                        ) {
+                            TextButton(
+                                onClick = {
+                                    isEditing = false
+                                    gateNumber = savedGateNumber
+                                }
+                            ) {
+                                Text("Cancel")
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = {
+                                    onSetGateNumber(gateNumber)
+                                    savedGateNumber = gateNumber
+                                    isEditing = false
+                                }
+                            ) {
+                                Text("Save Gate Number")
+                            }
+                        }
+                    } else {
+                        Button(
+                            onClick = {
+                                isEditing = true
+                                gateNumber = savedGateNumber
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "Edit"
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Edit Gate Number")
+                        }
+                    }
+                }
 
-                // Home Location
+                Divider(modifier = Modifier.padding(vertical = 8.dp))
+
+                // Gate Location
                 SettingItem(
                     icon = Icons.Default.LocationOn,
-                    label = "Home Location",
-                    value = currentHomeLocation?.let { 
-                        "Lat: ${String.format("%.6f", it.latitude)}\nLon: ${String.format("%.6f", it.longitude)}"
+                    label = "Gate Location",
+                    value = gateLocation?.let {
+                        "Lat: ${it.latitude}, Lon: ${it.longitude}"
                     } ?: "Not set"
-                )
+                ) {
+                    Button(
+                        onClick = {
+                            if (hasLocationPermission.value) {
+                                val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
+                                fusedLocationClient.lastLocation.addOnSuccessListener { location ->
+                                    if (location != null) {
+                                        scope.launch {
+                                            gateSettings.setHomeLocation(location)
+                                            gateLocation = location
+                                            if (currentLocation != null) {
+                                                distanceToGate = currentLocation!!.distanceTo(location)
+                                            }
+                                            Toast.makeText(context, "Gate location set", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            } else {
+                                onSetHomeLocation()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.LocationOn,
+                            contentDescription = "Set Location"
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Set Gate Location")
+                    }
+                }
 
-                // Radius
+                Divider(modifier = Modifier.padding(vertical = 8.dp))
+
+                // Radius Slider
                 SettingItem(
                     icon = Icons.Default.LocationOn,
                     label = "Radius",
-                    value = "${currentRadius.toInt()} meters"
+                    value = "${currentRadius.toInt()}m",
+                    content = {
+                        Slider(
+                            value = currentRadius,
+                            onValueChange = { currentRadius = it },
+                            valueRange = 5f..1000f,
+                            steps = 199,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 )
             }
         }
 
-        // Update Settings Card
+        // Clear Settings Card
         ElevatedCard(
-            modifier = Modifier
-                .fillMaxWidth()
-                .animateContentSize()
+            modifier = Modifier.fillMaxWidth()
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(20.dp)
+                    .padding(16.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Update Settings",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Icon(
-                        imageVector = Icons.Default.Edit,
-                        contentDescription = "Edit",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                Divider()
-
-                // Gate Number Input
-                OutlinedTextField(
-                    value = gateNumber,
-                    onValueChange = { gateNumber = it },
-                    label = { Text("Gate Phone Number") },
-                    leadingIcon = {
-                        Icon(
-                            imageVector = Icons.Default.Phone,
-                            contentDescription = "Phone"
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = MaterialTheme.shapes.medium
-                )
-
+                // Clear Settings Button
                 Button(
-                    onClick = {
-                        onSetGateNumber(gateNumber)
-                        onSetRadius(currentRadius)
-                    },
-                    modifier = Modifier.fillMaxWidth()
+                    onClick = { showClearConfirmation = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Check,
-                        contentDescription = "Save"
+                        imageVector = Icons.Default.Delete,
+                        contentDescription = "Clear"
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Save Settings")
-                }
-
-                // Home Location Button
-                OutlinedButton(
-                    onClick = onSetHomeLocation,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = MaterialTheme.shapes.medium
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.LocationOn,
-                        contentDescription = "Location"
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Set Current Location as Home")
-                }
-
-                // Radius Slider
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Gate Radius",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Text(
-                            text = "${radius.toInt()} meters",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    Slider(
-                        value = radius,
-                        onValueChange = { radius = it },
-                        valueRange = 10f..1000f,
-                        steps = 99,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = SliderDefaults.colors(
-                            thumbColor = MaterialTheme.colorScheme.primary,
-                            activeTrackColor = MaterialTheme.colorScheme.primary,
-                            inactiveTrackColor = MaterialTheme.colorScheme.primaryContainer
-                        )
-                    )
-                }
-
-                Button(
-                    onClick = { onSetRadius(radius) },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = MaterialTheme.shapes.medium
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Check,
-                        contentDescription = "Save"
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Save Radius")
+                    Text("Clear All Settings")
                 }
             }
+        }
+
+        // Clear Confirmation Dialog
+        if (showClearConfirmation) {
+            AlertDialog(
+                onDismissRequest = { showClearConfirmation = false },
+                title = { Text("Clear All Settings?") },
+                text = { Text("This will delete all saved settings including gate number, home location, and radius. This action cannot be undone.") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                gateSettings.clearAllSettings()
+                                // Reset all local state
+                                gateNumber = ""
+                                savedGateNumber = ""
+                                currentRadius = 5f
+                                gateLocation = null
+                                distanceToGate = null
+                                wasInRadius = false
+                                showClearConfirmation = false
+                            }
+                        }
+                    ) {
+                        Text("Clear", color = MaterialTheme.colorScheme.error)
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { showClearConfirmation = false }
+                    ) {
+                        Text("Cancel")
+                    }
+                }
+            )
         }
     }
 }
 
 @Composable
-private fun SettingItem(
+fun SettingItem(
     icon: ImageVector,
     label: String,
-    value: String
+    value: String,
+    content: @Composable (() -> Unit)? = null
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
-        verticalAlignment = Alignment.Top
+    Column(
+        modifier = Modifier.fillMaxWidth()
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(24.dp)
-        )
-        Column(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            }
             Text(
                 text = value,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+        if (content != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            content()
         }
     }
 }

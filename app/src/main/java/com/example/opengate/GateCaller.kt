@@ -7,6 +7,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.telecom.TelecomManager
+import android.util.Log
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.first
 
@@ -14,17 +16,49 @@ class GateCaller(
     private val context: Context,
     private val gateSettings: GateSettings
 ) {
-    suspend fun callGate() {
-        // Check for required permissions
-        if (!hasRequiredPermissions()) {
+    companion object {
+        private const val TAG = "GateCaller"
+    }
+
+    fun callGate() {
+        Log.d(TAG, "Attempting to call gate")
+        val gateNumber = gateSettings.getGateNumber()
+        Log.d(TAG, "Gate number: $gateNumber")
+        
+        if (gateNumber.isBlank()) {
+            Log.w(TAG, "Gate number is blank")
+            Toast.makeText(context, "Gate number not set", Toast.LENGTH_SHORT).show()
             return
         }
 
-        val gateNumber = gateSettings.gateNumber.first()
-        if (gateNumber.isNotBlank()) {
-            val intent = createCallIntent(gateNumber)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            context.startActivity(intent)
+        try {
+            val intent = Intent(Intent.ACTION_CALL).apply {
+                data = Uri.parse("tel:$gateNumber")
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            Log.d(TAG, "Created call intent: $intent")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
+                if (telecomManager.isInCall) {
+                    Log.w(TAG, "Already in a call")
+                    Toast.makeText(context, "Already in a call", Toast.LENGTH_SHORT).show()
+                    return
+                }
+            }
+
+            if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.CALL_PHONE) == 
+                android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                Log.d(TAG, "Starting call activity")
+                context.startActivity(intent)
+                Toast.makeText(context, "Calling gate...", Toast.LENGTH_SHORT).show()
+            } else {
+                Log.w(TAG, "Call permission not granted")
+                Toast.makeText(context, "Call permission not granted", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to call gate", e)
+            Toast.makeText(context, "Failed to call gate: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
