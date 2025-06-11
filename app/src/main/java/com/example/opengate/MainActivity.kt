@@ -61,42 +61,125 @@ class MainActivity : ComponentActivity() {
     private var _hasLocationPermission = mutableStateOf(false)
     val hasLocationPermission: State<Boolean> = _hasLocationPermission
 
-    private val requiredPermissions = arrayOf(
+    // Separate permission arrays for foreground and background
+    private val foregroundPermissions = arrayOf(
         Manifest.permission.ACCESS_FINE_LOCATION,
         Manifest.permission.CALL_PHONE,
-        Manifest.permission.READ_PHONE_STATE
+        Manifest.permission.READ_PHONE_STATE,
+        Manifest.permission.FOREGROUND_SERVICE,
+        Manifest.permission.FOREGROUND_SERVICE_LOCATION,
+        Manifest.permission.FOREGROUND_SERVICE_PHONE_CALL
     )
 
     private val backgroundLocationPermission = Manifest.permission.ACCESS_BACKGROUND_LOCATION
 
-    private val permissionLauncher = registerForActivityResult(
+    private val foregroundPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions.all { it.value }) {
-            // If we have all basic permissions, request background location
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                requestBackgroundLocation()
+        try {
+            val allGranted = permissions.all { it.value }
+            _hasLocationPermission.value = allGranted
+            
+            if (allGranted) {
+                // Only show background location dialog if we have foreground location
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    showBackgroundLocationDialog = true
+                } else {
+                    startLocationUpdates()
+                    startGateService()
+                }
             } else {
-                startLocationUpdates()
-                startGateService()
+                // Check if we at least have foreground location
+                val hasForegroundLocation = ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.ACCESS_FINE_LOCATION
+                ) == PackageManager.PERMISSION_GRANTED
+
+                if (hasForegroundLocation) {
+                    Toast.makeText(
+                        this,
+                        "Some permissions were denied. App functionality may be limited.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
-        } else {
-            showPermissionRationale()
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error handling foreground permissions", e)
         }
     }
 
     private val backgroundLocationLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
-        if (isGranted) {
-            startLocationUpdates()
+        try {
+            if (isGranted) {
+                Log.d("MainActivity", "Background location permission granted")
+                // Double check we have both permissions before proceeding
+                if (hasAllLocationPermissions()) {
+                    lifecycleScope.launch {
+                        try {
+                            startLocationUpdates()
+                            startGateService()
+                        } catch (e: SecurityException) {
+                            Log.e("MainActivity", "Security exception after background permission granted", e)
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Error starting location updates. Please restart the app.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                } else {
+                    Log.w("MainActivity", "Background permission granted but missing other permissions")
+                    Toast.makeText(
+                        this,
+                        "Some permissions are missing. Please grant all permissions.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } else {
+                Log.d("MainActivity", "Background location permission denied")
+                // Check if we still have foreground location
+                if (ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.ACCESS_FINE_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    Toast.makeText(
+                        this,
+                        "Background location denied. App will only work while open.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    Toast.makeText(
+                        this,
+                        "Location permission denied. App functionality will be limited.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error handling background location permission", e)
+            Toast.makeText(
+                this,
+                "Error handling permissions. Please try again.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    private val batteryOptimizationLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
             startGateService()
         } else {
-            showPermissionRationale()
+            Toast.makeText(this, "Battery optimization may affect app reliability", Toast.LENGTH_LONG).show()
         }
     }
 
     private var showBackgroundLocationDialog by mutableStateOf(false)
+    private var showBatteryOptimizationDialog by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,19 +187,19 @@ class MainActivity : ComponentActivity() {
         gateSettings = GateSettings(this)
         locationUpdates = LocationUpdates(this)
 
-        // Check if we need to request permissions
+        // Always show the UI first
+        showMainUI()
+
+        // Then check permissions
         if (!hasAllPermissions()) {
-            // Request permissions first
-            requestPermissions()
+            requestForegroundPermissions()
         } else {
-            // We already have all permissions, set the state and show UI
             _hasLocationPermission.value = true
-            showMainUI()
         }
     }
 
     private fun hasAllPermissions(): Boolean {
-        return requiredPermissions.all { permission ->
+        return foregroundPermissions.all { permission ->
             ContextCompat.checkSelfPermission(
                 this,
                 permission
@@ -124,12 +207,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestPermissions() {
-        ActivityCompat.requestPermissions(
-            this,
-            requiredPermissions,
-            PERMISSIONS_REQUEST_CODE
-        )
+    private fun requestForegroundPermissions() {
+        foregroundPermissionLauncher.launch(foregroundPermissions)
+    }
+
+    private fun requestBatteryOptimization() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent().apply {
+                action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                data = Uri.parse("package:$packageName")
+            }
+            batteryOptimizationLauncher.launch(intent)
+        }
     }
 
     private fun showMainUI() {
@@ -141,14 +230,53 @@ class MainActivity : ComponentActivity() {
                 ) {
                     if (showBackgroundLocationDialog) {
                         AlertDialog(
-                            onDismissRequest = { showBackgroundLocationDialog = false },
+                            onDismissRequest = { 
+                                showBackgroundLocationDialog = false
+                                // Check if we still have foreground location
+                                if (ContextCompat.checkSelfPermission(
+                                        this@MainActivity,
+                                        Manifest.permission.ACCESS_FINE_LOCATION
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        "App will only work while open",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            },
                             title = { Text("Background Location Required") },
                             text = { Text("This app needs background location access to automatically call the gate when you approach it, even when the app is closed or the phone is locked.") },
                             confirmButton = {
                                 TextButton(
                                     onClick = {
                                         showBackgroundLocationDialog = false
-                                        backgroundLocationLauncher.launch(backgroundLocationPermission)
+                                        // Double check we have foreground location before requesting background
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                            val hasForegroundLocation = ContextCompat.checkSelfPermission(
+                                                this@MainActivity,
+                                                Manifest.permission.ACCESS_FINE_LOCATION
+                                            ) == PackageManager.PERMISSION_GRANTED
+
+                                            if (hasForegroundLocation) {
+                                                try {
+                                                    backgroundLocationLauncher.launch(backgroundLocationPermission)
+                                                } catch (e: Exception) {
+                                                    Log.e("MainActivity", "Error launching background location request", e)
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "Error requesting background location. Please try again.",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
+                                            } else {
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    "Please grant foreground location permission first",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                        }
                                     }
                                 ) {
                                     Text("Grant Permission")
@@ -156,13 +284,56 @@ class MainActivity : ComponentActivity() {
                             },
                             dismissButton = {
                                 TextButton(
-                                    onClick = { showBackgroundLocationDialog = false }
+                                    onClick = { 
+                                        showBackgroundLocationDialog = false
+                                        // Check if we still have foreground location
+                                        if (ContextCompat.checkSelfPermission(
+                                                this@MainActivity,
+                                                Manifest.permission.ACCESS_FINE_LOCATION
+                                            ) == PackageManager.PERMISSION_GRANTED
+                                        ) {
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                "App will only work while open",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
                                 ) {
                                     Text("Not Now")
                                 }
                             }
                         )
                     }
+
+                    if (showBatteryOptimizationDialog) {
+                        AlertDialog(
+                            onDismissRequest = { showBatteryOptimizationDialog = false },
+                            title = { Text("Battery Optimization") },
+                            text = { Text("For best reliability, please disable battery optimization for this app. This will ensure the app can monitor your location even when the phone is locked.") },
+                            confirmButton = {
+                                TextButton(
+                                    onClick = {
+                                        showBatteryOptimizationDialog = false
+                                        requestBatteryOptimization()
+                                    }
+                                ) {
+                                    Text("Disable Optimization")
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(
+                                    onClick = { 
+                                        showBatteryOptimizationDialog = false
+                                        startGateService()
+                                    }
+                                ) {
+                                    Text("Not Now")
+                                }
+                            }
+                        )
+                    }
+
                     MainScreen(
                         hasLocationPermission = hasLocationPermission,
                         onSetGateNumber = { number ->
@@ -180,12 +351,19 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             } else {
-                                requestPermissions()
+                                requestForegroundPermissions()
                             }
                         },
                         onSetRadius = { radius ->
                             lifecycleScope.launch {
                                 gateSettings.setRadius(radius)
+                            }
+                        },
+                        onStartMonitoring = {
+                            if (hasAllPermissions()) {
+                                showBatteryOptimizationDialog = true
+                            } else {
+                                requestForegroundPermissions()
                             }
                         }
                     )
@@ -194,47 +372,75 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun checkPermissions() {
-        if (requiredPermissions.all {
-                ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-            }) {
-            startLocationUpdates()
-            startGateService()
-        } else {
-            permissionLauncher.launch(requiredPermissions)
-        }
-    }
-
     private fun startGateService() {
-        val serviceIntent = Intent(this, GateService::class.java)
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
+        try {
+            if (hasAllLocationPermissions()) {
+                val serviceIntent = Intent(this, GateMonitorService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
+            } else {
+                Log.w("MainActivity", "Cannot start gate service: missing permissions")
+            }
+        } catch (e: SecurityException) {
+            Log.e("MainActivity", "Security exception starting service", e)
+            Toast.makeText(
+                this,
+                "Error starting service. Please check permissions.",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
     private fun startLocationUpdates() {
-        locationCallback = object : LocationCallback() {
-            override fun onLocationResult(locationResult: LocationResult) {
-                locationResult.lastLocation?.let { location ->
-                    // Send location update to the service
-                    val intent = Intent(this@MainActivity, GateService::class.java).apply {
-                        action = "LOCATION_UPDATE"
-                        putExtra("location", location)
+        try {
+            if (hasAllLocationPermissions()) {
+                locationCallback = object : LocationCallback() {
+                    override fun onLocationResult(locationResult: LocationResult) {
+                        try {
+                            locationResult.lastLocation?.let { location ->
+                                // Send location update to the service
+                                val intent = Intent(this@MainActivity, GateMonitorService::class.java).apply {
+                                    action = "LOCATION_UPDATE"
+                                    putExtra("location", location)
+                                }
+                                startService(intent)
+                            }
+                        } catch (e: Exception) {
+                            Log.e("MainActivity", "Error handling location update", e)
+                        }
                     }
-                    startService(intent)
+                }.also { callback ->
+                    lifecycleScope.launch {
+                        try {
+                            locationUpdates.startLocationUpdates(callback)
+                        } catch (e: SecurityException) {
+                            Log.e("MainActivity", "Security exception starting location updates", e)
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Error starting location updates. Please check permissions.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
                 }
+            } else {
+                Log.w("MainActivity", "Cannot start location updates: missing permissions")
             }
-        }.also { callback ->
-            lifecycleScope.launch {
-                locationUpdates.startLocationUpdates(callback)
-            }
+        } catch (e: SecurityException) {
+            Log.e("MainActivity", "Security exception in startLocationUpdates", e)
+            Toast.makeText(
+                this,
+                "Error starting location updates. Please check permissions.",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
     private fun showPermissionRationale() {
-        // This is now handled in the Compose UI
+        showBackgroundLocationDialog = true
     }
 
     private fun checkLocationPermission(): Boolean {
@@ -251,36 +457,55 @@ class MainActivity : ComponentActivity() {
                     .addOnSuccessListener { location ->
                         if (location != null) {
                             callback(location)
+                        } else {
+                            // If last location is null, request a new location update
+                            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10000)
+                                .setMinUpdateIntervalMillis(5000)
+                                .build()
+
+                            fusedLocationClient.requestLocationUpdates(
+                                locationRequest,
+                                object : LocationCallback() {
+                                    override fun onLocationResult(locationResult: LocationResult) {
+                                        locationResult.lastLocation?.let { location ->
+                                            callback(location)
+                                            fusedLocationClient.removeLocationUpdates(this)
+                                        }
+                                    }
+                                },
+                                Looper.getMainLooper()
+                            )
                         }
                     }
-            } catch (e: Exception) {
-                Log.e("MainActivity", "Error getting location", e)
+                    .addOnFailureListener { e ->
+                        Log.e("MainActivity", "Error getting location", e)
+                        Toast.makeText(this, "Error getting location", Toast.LENGTH_SHORT).show()
+                    }
+            } catch (e: SecurityException) {
+                Log.e("MainActivity", "Security exception getting location", e)
+                Toast.makeText(this, "Location permission required", Toast.LENGTH_SHORT).show()
             }
+        } else {
+            requestForegroundPermissions()
         }
     }
 
-    private fun requestBackgroundLocation() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            when {
-                ContextCompat.checkSelfPermission(
-                    this,
-                    backgroundLocationPermission
-                ) == PackageManager.PERMISSION_GRANTED -> {
-                    startLocationUpdates()
-                    startGateService()
-                }
-                shouldShowRequestPermissionRationale(backgroundLocationPermission) -> {
-                    showBackgroundLocationRationale()
-                }
-                else -> {
-                    backgroundLocationLauncher.launch(backgroundLocationPermission)
-                }
-            }
-        }
-    }
+    private fun hasAllLocationPermissions(): Boolean {
+        val hasForegroundLocation = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
 
-    private fun showBackgroundLocationRationale() {
-        showBackgroundLocationDialog = true
+        val hasBackgroundLocation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContextCompat.checkSelfPermission(
+                this,
+                backgroundLocationPermission
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true // On Android 9 and lower, background location is included with foreground
+        }
+
+        return hasForegroundLocation && hasBackgroundLocation
     }
 
     override fun onDestroy() {
@@ -321,7 +546,8 @@ fun MainScreen(
     hasLocationPermission: State<Boolean>,
     onSetGateNumber: (String) -> Unit,
     onSetHomeLocation: () -> Unit,
-    onSetRadius: (Float) -> Unit
+    onSetRadius: (Float) -> Unit,
+    onStartMonitoring: () -> Unit
 ) {
     val context = LocalContext.current
     val gateSettings = remember { GateSettings(context) }

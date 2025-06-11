@@ -121,4 +121,18 @@ class GateSettings(private val context: Context) {
             preferences.clear()
         }
     }
+
+    fun isNearGate(location: Location): Boolean {
+        val homeLocation = getHomeLocation()
+        if (homeLocation == null) {
+            Log.d(TAG, "Home location is not set")
+            return false
+        }
+
+        val distance = location.distanceTo(homeLocation)
+        val currentRadius = getRadius()
+        val isNear = distance <= currentRadius
+        Log.d(TAG, "Distance to gate: $distance meters, radius: $currentRadius meters, isNear: $isNear")
+        return isNear
+    }
 } 
