@@ -112,14 +112,50 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         try {
-            if (isGranted) {
-                Log.d("MainActivity", "Background location permission granted")
-                // Double check we have both permissions before proceeding
-                if (hasAllLocationPermissions()) {
+            Log.d("MainActivity", "Background location permission result: $isGranted")
+            
+            // First, verify the permission state
+            val hasBackgroundLocation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContextCompat.checkSelfPermission(
+                    this,
+                    backgroundLocationPermission
+                ) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+            
+            Log.d("MainActivity", "Verified background location permission: $hasBackgroundLocation")
+            
+            if (isGranted && hasBackgroundLocation) {
+                Log.d("MainActivity", "Background location permission confirmed granted")
+                
+                // Verify we still have foreground location
+                val hasForegroundLocation = ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.ACCESS_FINE_LOCATION
+                ) == PackageManager.PERMISSION_GRANTED
+                
+                Log.d("MainActivity", "Foreground location permission: $hasForegroundLocation")
+                
+                if (hasForegroundLocation) {
                     lifecycleScope.launch {
                         try {
-                            startLocationUpdates()
-                            startGateService()
+                            // Wait for permission change to be fully processed
+                            kotlinx.coroutines.delay(1000)
+                            
+                            // Double check permissions again after delay
+                            if (hasAllLocationPermissions()) {
+                                Log.d("MainActivity", "Starting location updates and service")
+                                startLocationUpdates()
+                                startGateService()
+                            } else {
+                                Log.w("MainActivity", "Lost permissions during delay")
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "Error: Lost permissions. Please try again.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
                         } catch (e: SecurityException) {
                             Log.e("MainActivity", "Security exception after background permission granted", e)
                             Toast.makeText(
@@ -130,15 +166,15 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 } else {
-                    Log.w("MainActivity", "Background permission granted but missing other permissions")
+                    Log.w("MainActivity", "Lost foreground location permission")
                     Toast.makeText(
                         this,
-                        "Some permissions are missing. Please grant all permissions.",
+                        "Error: Lost foreground location permission. Please grant all permissions.",
                         Toast.LENGTH_LONG
                     ).show()
                 }
             } else {
-                Log.d("MainActivity", "Background location permission denied")
+                Log.d("MainActivity", "Background location permission denied or not verified")
                 // Check if we still have foreground location
                 if (ContextCompat.checkSelfPermission(
                         this,
@@ -374,21 +410,55 @@ class MainActivity : ComponentActivity() {
 
     private fun startGateService() {
         try {
-            if (hasAllLocationPermissions()) {
-                val serviceIntent = Intent(this, GateMonitorService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(serviceIntent)
-                } else {
-                    startService(serviceIntent)
-                }
-            } else {
+            Log.d("MainActivity", "Starting gate service")
+            
+            // Double check permissions
+            if (!hasAllLocationPermissions()) {
                 Log.w("MainActivity", "Cannot start gate service: missing permissions")
+                return
             }
-        } catch (e: SecurityException) {
-            Log.e("MainActivity", "Security exception starting service", e)
+            
+            // Stop any existing service first
+            Log.d("MainActivity", "Stopping existing service")
+            stopService(Intent(this, GateMonitorService::class.java))
+            
+            // Add a delay before starting the new service
+            lifecycleScope.launch {
+                try {
+                    Log.d("MainActivity", "Waiting before starting new service")
+                    kotlinx.coroutines.delay(1000)
+                    
+                    // Check permissions again after delay
+                    if (hasAllLocationPermissions()) {
+                        Log.d("MainActivity", "Starting new service")
+                        val serviceIntent = Intent(this@MainActivity, GateMonitorService::class.java)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(serviceIntent)
+                        } else {
+                            startService(serviceIntent)
+                        }
+                    } else {
+                        Log.w("MainActivity", "Lost permissions during delay")
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Error: Lost permissions. Please try again.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                } catch (e: SecurityException) {
+                    Log.e("MainActivity", "Security exception starting service", e)
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Error starting service. Please check permissions.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error in startGateService", e)
             Toast.makeText(
                 this,
-                "Error starting service. Please check permissions.",
+                "Error starting service. Please try again.",
                 Toast.LENGTH_LONG
             ).show()
         }
@@ -396,44 +466,78 @@ class MainActivity : ComponentActivity() {
 
     private fun startLocationUpdates() {
         try {
-            if (hasAllLocationPermissions()) {
-                locationCallback = object : LocationCallback() {
-                    override fun onLocationResult(locationResult: LocationResult) {
-                        try {
-                            locationResult.lastLocation?.let { location ->
-                                // Send location update to the service
-                                val intent = Intent(this@MainActivity, GateMonitorService::class.java).apply {
-                                    action = "LOCATION_UPDATE"
-                                    putExtra("location", location)
-                                }
-                                startService(intent)
-                            }
-                        } catch (e: Exception) {
-                            Log.e("MainActivity", "Error handling location update", e)
-                        }
-                    }
-                }.also { callback ->
-                    lifecycleScope.launch {
-                        try {
-                            locationUpdates.startLocationUpdates(callback)
-                        } catch (e: SecurityException) {
-                            Log.e("MainActivity", "Security exception starting location updates", e)
-                            Toast.makeText(
-                                this@MainActivity,
-                                "Error starting location updates. Please check permissions.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
-                }
-            } else {
+            Log.d("MainActivity", "Starting location updates")
+            
+            // Double check permissions
+            if (!hasAllLocationPermissions()) {
                 Log.w("MainActivity", "Cannot start location updates: missing permissions")
+                return
             }
-        } catch (e: SecurityException) {
-            Log.e("MainActivity", "Security exception in startLocationUpdates", e)
+            
+            // Stop any existing location updates first
+            locationCallback?.let { callback ->
+                Log.d("MainActivity", "Stopping existing location updates")
+                locationUpdates.stopLocationUpdates(callback)
+            }
+            
+            // Add a delay before starting new updates
+            lifecycleScope.launch {
+                try {
+                    Log.d("MainActivity", "Waiting before starting new location updates")
+                    kotlinx.coroutines.delay(1000)
+                    
+                    // Check permissions again after delay
+                    if (hasAllLocationPermissions()) {
+                        Log.d("MainActivity", "Starting new location updates")
+                        locationCallback = object : LocationCallback() {
+                            override fun onLocationResult(locationResult: LocationResult) {
+                                try {
+                                    locationResult.lastLocation?.let { location ->
+                                        // Send location update to the service
+                                        val intent = Intent(this@MainActivity, GateMonitorService::class.java).apply {
+                                            action = "LOCATION_UPDATE"
+                                            putExtra("location", location)
+                                        }
+                                        startService(intent)
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e("MainActivity", "Error handling location update", e)
+                                }
+                            }
+                        }.also { callback ->
+                            try {
+                                locationUpdates.startLocationUpdates(callback)
+                            } catch (e: SecurityException) {
+                                Log.e("MainActivity", "Security exception starting location updates", e)
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "Error starting location updates. Please check permissions.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    } else {
+                        Log.w("MainActivity", "Lost permissions during delay")
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Error: Lost permissions. Please try again.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Error in startLocationUpdates", e)
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Error starting location updates. Please try again.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error in startLocationUpdates", e)
             Toast.makeText(
                 this,
-                "Error starting location updates. Please check permissions.",
+                "Error starting location updates. Please try again.",
                 Toast.LENGTH_LONG
             ).show()
         }

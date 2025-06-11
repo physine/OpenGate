@@ -44,7 +44,8 @@
             android:name=".GateMonitorService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="location|phoneCall" />
+            android:foregroundServiceType="location"
+            android:permission="android.permission.BIND_FOREGROUND_SERVICE" />
     </application>
 
 </manifest>

@@ -1,18 +1,23 @@
 package com.example.opengate
 
+import android.Manifest
 import android.app.*
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.location.Location
+import android.os.Build
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.google.android.gms.location.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.tasks.await
@@ -49,11 +54,12 @@ class GateMonitorService : Service() {
         gateCaller = GateCaller(this, gateSettings)
         createLocationCallback()
         createNotificationChannel()
-        acquireWakeLock()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "Service starting")
+        
+        // Create and start foreground notification first
         val notification = createNotification()
         startForeground(NOTIFICATION_ID, notification)
 
@@ -65,11 +71,47 @@ class GateMonitorService : Service() {
         } else if (!isInitialized) {
             Log.d(TAG, "Initializing service state")
             serviceScope.launch {
-                initializeServiceState()
+                try {
+                    // Add a small delay to ensure permissions are fully processed
+                    delay(1000)
+                    
+                    // Check permissions before proceeding
+                    if (checkLocationPermissions()) {
+                        acquireWakeLock()
+                        initializeServiceState()
+                        // Only start location updates after initialization
+                        startLocationUpdates()
+                    } else {
+                        Log.e(TAG, "Missing required permissions")
+                        stopSelf()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error during service initialization", e)
+                    stopSelf()
+                }
             }
         }
 
         return START_STICKY
+    }
+
+    private fun checkLocationPermissions(): Boolean {
+        val hasForegroundLocation = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val hasBackgroundLocation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_BACKGROUND_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        Log.d(TAG, "Permission check - Foreground: $hasForegroundLocation, Background: $hasBackgroundLocation")
+        return hasForegroundLocation && hasBackgroundLocation
     }
 
     private fun acquireWakeLock() {
@@ -84,35 +126,19 @@ class GateMonitorService : Service() {
         }
     }
 
-    private suspend fun initializeServiceState() {
-        Log.d(TAG, "Initializing service state")
-        try {
-            // Get the current location
-            val location = fusedLocationClient.lastLocation.await()
-            Log.d(TAG, "Initial location: $location")
-            if (location != null) {
-                // Set the initial state without triggering a gate call
-                lastLocation = location
-                isInRadius = isWithinRadius(location)
-                Log.d(TAG, "Initial state: isInRadius=$isInRadius")
-                isInitialized = true
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error initializing service state", e)
-        }
-    }
-
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            CHANNEL_NAME,
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Monitors location for gate calling"
-            setShowBadge(false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Monitors location for gate calling"
+                setShowBadge(false)
+            }
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
         }
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.createNotificationChannel(channel)
     }
 
     private fun createNotification(): Notification {
@@ -144,12 +170,19 @@ class GateMonitorService : Service() {
     }
 
     private fun startLocationUpdates() {
-        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, LOCATION_UPDATE_INTERVAL)
-            .setMinUpdateIntervalMillis(LOCATION_UPDATE_FASTEST_INTERVAL)
-            .setMaxUpdateDelayMillis(LOCATION_UPDATE_INTERVAL * 2)
-            .build()
-
         try {
+            // Double check permissions before starting updates
+            if (!checkLocationPermissions()) {
+                Log.e(TAG, "Cannot start location updates: missing permissions")
+                stopSelf()
+                return
+            }
+
+            val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, LOCATION_UPDATE_INTERVAL)
+                .setMinUpdateIntervalMillis(LOCATION_UPDATE_FASTEST_INTERVAL)
+                .setMaxUpdateDelayMillis(LOCATION_UPDATE_INTERVAL * 2)
+                .build()
+
             fusedLocationClient.requestLocationUpdates(
                 locationRequest,
                 locationCallback,
@@ -158,6 +191,35 @@ class GateMonitorService : Service() {
             Log.d(TAG, "Location updates started")
         } catch (e: SecurityException) {
             Log.e(TAG, "Security exception while requesting location updates", e)
+            stopSelf()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting location updates", e)
+            stopSelf()
+        }
+    }
+
+    private suspend fun initializeServiceState() {
+        Log.d(TAG, "Initializing service state")
+        try {
+            // Get the current location
+            val location = fusedLocationClient.lastLocation.await()
+            Log.d(TAG, "Initial location: $location")
+            if (location != null) {
+                // Set the initial state without triggering a gate call
+                lastLocation = location
+                isInRadius = isWithinRadius(location)
+                Log.d(TAG, "Initial state: isInRadius=$isInRadius")
+                isInitialized = true
+            } else {
+                Log.w(TAG, "No initial location available")
+                // Don't stop the service, just wait for the first location update
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception during initialization", e)
+            throw e // Propagate to stop the service
+        } catch (e: Exception) {
+            Log.e(TAG, "Error initializing service state", e)
+            throw e // Propagate to stop the service
         }
     }
 
@@ -172,6 +234,13 @@ class GateMonitorService : Service() {
         Log.d(TAG, "Handling location update: $location")
         serviceScope.launch {
             try {
+                // Check permissions before processing update
+                if (!checkLocationPermissions()) {
+                    Log.e(TAG, "Lost permissions during location update")
+                    stopSelf()
+                    return@launch
+                }
+
                 // Check if we have a valid gate number and location
                 val gateNumber = gateSettings.getGateNumber()
                 val gateLocation = gateSettings.getHomeLocation()
@@ -222,6 +291,9 @@ class GateMonitorService : Service() {
                     // Reset the call state when we leave the radius
                     gateSettings.setHasCalledGate(false)
                 }
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Security exception handling location update", e)
+                stopSelf()
             } catch (e: Exception) {
                 Log.e(TAG, "Error handling location update", e)
             }
