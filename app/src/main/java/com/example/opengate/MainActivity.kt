@@ -50,6 +50,8 @@ import kotlin.math.roundToInt
 import android.os.Build
 
 class MainActivity : ComponentActivity() {
+    private val TAG = "MainActivity"
+    
     private lateinit var gateSettings: GateSettings
     private lateinit var locationUpdates: LocationUpdates
     private var locationCallback: LocationCallback? = null
@@ -58,163 +60,114 @@ class MainActivity : ComponentActivity() {
     }
 
     // State to track permission
-    private var _hasLocationPermission = mutableStateOf(false)
+    private val _hasLocationPermission = mutableStateOf(false)
     val hasLocationPermission: State<Boolean> = _hasLocationPermission
 
-    // Separate permission arrays for foreground and background
-    private val foregroundPermissions = arrayOf(
-        Manifest.permission.ACCESS_FINE_LOCATION,
-        Manifest.permission.CALL_PHONE,
-        Manifest.permission.READ_PHONE_STATE,
-        Manifest.permission.FOREGROUND_SERVICE,
-        Manifest.permission.FOREGROUND_SERVICE_LOCATION,
-        Manifest.permission.FOREGROUND_SERVICE_PHONE_CALL
-    )
-
-    private val backgroundLocationPermission = Manifest.permission.ACCESS_BACKGROUND_LOCATION
-
-    private val foregroundPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        try {
-            val allGranted = permissions.all { it.value }
-            _hasLocationPermission.value = allGranted
-            
-            if (allGranted) {
-                // Only show background location dialog if we have foreground location
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    showBackgroundLocationDialog = true
-                } else {
-                    startLocationUpdates()
-                    startGateService()
-                }
-            } else {
-                // Check if we at least have foreground location
-                val hasForegroundLocation = ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-
-                if (hasForegroundLocation) {
-                    Toast.makeText(
-                        this,
-                        "Some permissions were denied. App functionality may be limited.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error handling foreground permissions", e)
-        }
+    private val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.FOREGROUND_SERVICE,
+            Manifest.permission.FOREGROUND_SERVICE_LOCATION,
+            Manifest.permission.FOREGROUND_SERVICE_PHONE_CALL,
+            Manifest.permission.POST_NOTIFICATIONS
+        )
+    } else {
+        arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.FOREGROUND_SERVICE,
+            Manifest.permission.FOREGROUND_SERVICE_LOCATION,
+            Manifest.permission.FOREGROUND_SERVICE_PHONE_CALL
+        )
     }
 
-    private val backgroundLocationLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        try {
-            Log.d("MainActivity", "Background location permission result: $isGranted")
-            
-            // First, verify the permission state
-            val hasBackgroundLocation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ContextCompat.checkSelfPermission(
-                    this,
-                    backgroundLocationPermission
-                ) == PackageManager.PERMISSION_GRANTED
-            } else {
-                true
-            }
-            
-            Log.d("MainActivity", "Verified background location permission: $hasBackgroundLocation")
-            
-            if (isGranted && hasBackgroundLocation) {
-                Log.d("MainActivity", "Background location permission confirmed granted")
-                
-                // Verify we still have foreground location
-                val hasForegroundLocation = ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-                
-                Log.d("MainActivity", "Foreground location permission: $hasForegroundLocation")
-                
-                if (hasForegroundLocation) {
-                    lifecycleScope.launch {
-                        try {
-                            // Wait for permission change to be fully processed
-                            kotlinx.coroutines.delay(1000)
-                            
-                            // Double check permissions again after delay
-                            if (hasAllLocationPermissions()) {
-                                Log.d("MainActivity", "Starting location updates and service")
-                                startLocationUpdates()
-                                startGateService()
-                            } else {
-                                Log.w("MainActivity", "Lost permissions during delay")
-                                Toast.makeText(
-                                    this@MainActivity,
-                                    "Error: Lost permissions. Please try again.",
-                                    Toast.LENGTH_LONG
-                                ).show()
-                            }
-                        } catch (e: SecurityException) {
-                            Log.e("MainActivity", "Security exception after background permission granted", e)
-                            Toast.makeText(
-                                this@MainActivity,
-                                "Error starting location updates. Please restart the app.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
-                } else {
-                    Log.w("MainActivity", "Lost foreground location permission")
-                    Toast.makeText(
-                        this,
-                        "Error: Lost foreground location permission. Please grant all permissions.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            } else {
-                Log.d("MainActivity", "Background location permission denied or not verified")
-                // Check if we still have foreground location
-                if (ContextCompat.checkSelfPermission(
-                        this,
-                        Manifest.permission.ACCESS_FINE_LOCATION
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    Toast.makeText(
-                        this,
-                        "Background location denied. App will only work while open.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                } else {
-                    Toast.makeText(
-                        this,
-                        "Location permission denied. App functionality will be limited.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error handling background location permission", e)
-            Toast.makeText(
-                this,
-                "Error handling permissions. Please try again.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
+    private val backgroundLocationPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        Manifest.permission.ACCESS_BACKGROUND_LOCATION
+    } else {
+        null
     }
 
     private val batteryOptimizationLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
-            startGateService()
+            Log.d(TAG, "Battery optimization disabled")
+            startService()
         } else {
-            Toast.makeText(this, "Battery optimization may affect app reliability", Toast.LENGTH_LONG).show()
+            Log.d(TAG, "Battery optimization not disabled")
+            Toast.makeText(
+                this,
+                "Battery optimization must be disabled for the app to work properly",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
-    private var showBackgroundLocationDialog by mutableStateOf(false)
+    private val foregroundPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.entries.all { it.value }
+        if (allGranted) {
+            _hasLocationPermission.value = true
+            // Check if we need to request background location
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                when {
+                    // If we already have background permission, we're done
+                    ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.ACCESS_BACKGROUND_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED -> {
+                        Log.d(TAG, "Background location already granted")
+                        startService()
+                    }
+                    // If we should show rationale, show it
+                    shouldShowRequestPermissionRationale(Manifest.permission.ACCESS_BACKGROUND_LOCATION) -> {
+                        Log.d(TAG, "Showing background location rationale")
+                        _showBackgroundLocationDialog.value = true
+                    }
+                    // Otherwise request background permission
+                    else -> {
+                        Log.d(TAG, "Requesting background location")
+                        backgroundPermissionLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                    }
+                }
+            } else {
+                // On older Android versions, we can start the service immediately
+                startService()
+            }
+        } else {
+            _hasLocationPermission.value = false
+            Toast.makeText(
+                this,
+                "Location permission is required for the app to work",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    private val backgroundPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            Log.d(TAG, "Background location granted")
+            startService()
+        } else {
+            Log.d(TAG, "Background location denied")
+            // Show a message that the app will only work while open
+            Toast.makeText(
+                this,
+                "Background location access denied. The app will only work while open.",
+                Toast.LENGTH_LONG
+            ).show()
+            // Still start the service as it will work in foreground
+            startService()
+        }
+    }
+
+    private val _showBackgroundLocationDialog = mutableStateOf(false)
     private var showBatteryOptimizationDialog by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -234,29 +187,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun hasAllPermissions(): Boolean {
-        return foregroundPermissions.all { permission ->
-            ContextCompat.checkSelfPermission(
-                this,
-                permission
-            ) == PackageManager.PERMISSION_GRANTED
-        }
-    }
-
-    private fun requestForegroundPermissions() {
-        foregroundPermissionLauncher.launch(foregroundPermissions)
-    }
-
-    private fun requestBatteryOptimization() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val intent = Intent().apply {
-                action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                data = Uri.parse("package:$packageName")
-            }
-            batteryOptimizationLauncher.launch(intent)
-        }
-    }
-
     private fun showMainUI() {
         setContent {
             MaterialTheme {
@@ -264,79 +194,34 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    if (showBackgroundLocationDialog) {
+                    if (_showBackgroundLocationDialog.value) {
                         AlertDialog(
-                            onDismissRequest = { 
-                                showBackgroundLocationDialog = false
-                                // Check if we still have foreground location
-                                if (ContextCompat.checkSelfPermission(
-                                        this@MainActivity,
-                                        Manifest.permission.ACCESS_FINE_LOCATION
-                                    ) == PackageManager.PERMISSION_GRANTED
-                                ) {
-                                    Toast.makeText(
-                                        this@MainActivity,
-                                        "App will only work while open",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                }
-                            },
+                            onDismissRequest = { _showBackgroundLocationDialog.value = false },
                             title = { Text("Background Location Required") },
-                            text = { Text("This app needs background location access to automatically call the gate when you approach it, even when the app is closed or the phone is locked.") },
+                            text = { Text("This app needs background location access to call the gate when you arrive, even when the app is closed or the phone is locked.") },
                             confirmButton = {
                                 TextButton(
                                     onClick = {
-                                        showBackgroundLocationDialog = false
-                                        // Double check we have foreground location before requesting background
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                            val hasForegroundLocation = ContextCompat.checkSelfPermission(
-                                                this@MainActivity,
-                                                Manifest.permission.ACCESS_FINE_LOCATION
-                                            ) == PackageManager.PERMISSION_GRANTED
-
-                                            if (hasForegroundLocation) {
-                                                try {
-                                                    backgroundLocationLauncher.launch(backgroundLocationPermission)
-                                                } catch (e: Exception) {
-                                                    Log.e("MainActivity", "Error launching background location request", e)
-                                                    Toast.makeText(
-                                                        this@MainActivity,
-                                                        "Error requesting background location. Please try again.",
-                                                        Toast.LENGTH_LONG
-                                                    ).show()
-                                                }
-                                            } else {
-                                                Toast.makeText(
-                                                    this@MainActivity,
-                                                    "Please grant foreground location permission first",
-                                                    Toast.LENGTH_LONG
-                                                ).show()
-                                            }
-                                        }
+                                        _showBackgroundLocationDialog.value = false
+                                        backgroundPermissionLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
                                     }
                                 ) {
-                                    Text("Grant Permission")
+                                    Text("Grant")
                                 }
                             },
                             dismissButton = {
                                 TextButton(
-                                    onClick = { 
-                                        showBackgroundLocationDialog = false
-                                        // Check if we still have foreground location
-                                        if (ContextCompat.checkSelfPermission(
-                                                this@MainActivity,
-                                                Manifest.permission.ACCESS_FINE_LOCATION
-                                            ) == PackageManager.PERMISSION_GRANTED
-                                        ) {
-                                            Toast.makeText(
-                                                this@MainActivity,
-                                                "App will only work while open",
-                                                Toast.LENGTH_LONG
-                                            ).show()
-                                        }
+                                    onClick = {
+                                        _showBackgroundLocationDialog.value = false
+                                        Toast.makeText(
+                                            this@MainActivity,
+                                            "The app will only work while open",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        startService()
                                     }
                                 ) {
-                                    Text("Not Now")
+                                    Text("Deny")
                                 }
                             }
                         )
@@ -346,7 +231,7 @@ class MainActivity : ComponentActivity() {
                         AlertDialog(
                             onDismissRequest = { showBatteryOptimizationDialog = false },
                             title = { Text("Battery Optimization") },
-                            text = { Text("For best reliability, please disable battery optimization for this app. This will ensure the app can monitor your location even when the phone is locked.") },
+                            text = { Text("This app needs to be excluded from battery optimization to work properly in the background.") },
                             confirmButton = {
                                 TextButton(
                                     onClick = {
@@ -354,14 +239,18 @@ class MainActivity : ComponentActivity() {
                                         requestBatteryOptimization()
                                     }
                                 ) {
-                                    Text("Disable Optimization")
+                                    Text("Disable")
                                 }
                             },
                             dismissButton = {
                                 TextButton(
-                                    onClick = { 
+                                    onClick = {
                                         showBatteryOptimizationDialog = false
-                                        startGateService()
+                                        Toast.makeText(
+                                            this@MainActivity,
+                                            "The app may not work properly in the background",
+                                            Toast.LENGTH_LONG
+                                        ).show()
                                     }
                                 ) {
                                     Text("Not Now")
@@ -405,6 +294,45 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+        }
+    }
+
+    private fun startService() {
+        val serviceIntent = Intent(this, GateMonitorService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+    }
+
+    private fun hasAllPermissions(): Boolean {
+        return requiredPermissions.all { permission ->
+            ContextCompat.checkSelfPermission(
+                this,
+                permission
+            ) == PackageManager.PERMISSION_GRANTED
+        } && if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_BACKGROUND_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+    }
+
+    private fun requestForegroundPermissions() {
+        foregroundPermissionLauncher.launch(requiredPermissions)
+    }
+
+    private fun requestBatteryOptimization() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent().apply {
+                action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                data = Uri.parse("package:$packageName")
+            }
+            batteryOptimizationLauncher.launch(intent)
         }
     }
 
@@ -544,7 +472,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showPermissionRationale() {
-        showBackgroundLocationDialog = true
+        _showBackgroundLocationDialog.value = true
     }
 
     private fun checkLocationPermission(): Boolean {
@@ -603,7 +531,7 @@ class MainActivity : ComponentActivity() {
         val hasBackgroundLocation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ContextCompat.checkSelfPermission(
                 this,
-                backgroundLocationPermission
+                backgroundLocationPermission!!
             ) == PackageManager.PERMISSION_GRANTED
         } else {
             true // On Android 9 and lower, background location is included with foreground
